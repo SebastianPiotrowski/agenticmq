@@ -146,8 +146,8 @@ impl Broker {
         for (i, task_id) in deferred.iter().enumerate() {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
-                // Perform rate limit check
-                if self.limiter.check_and_record(model, task.token_budget).await.is_ok() {
+                // Perform rate limit check passing task_id
+                if self.limiter.check_and_record(model, *task_id, task.token_budget).await.is_ok() {
                     selected_index = Some(i);
                     break;
                 }
@@ -164,8 +164,8 @@ impl Broker {
         while let Ok(task_id) = rx.try_recv() {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(&task_id) {
-                // Perform rate limit check
-                if self.limiter.check_and_record(model, task.token_budget).await.is_ok() {
+                // Perform rate limit check passing task_id
+                if self.limiter.check_and_record(model, task_id, task.token_budget).await.is_ok() {
                     // Drop read lock before calling async set_task_processing
                     drop(tasks);
                     return self.set_task_processing(task_id, model).await;
@@ -182,6 +182,13 @@ impl Broker {
     async fn set_task_processing(&self, task_id: Uuid, model: &str) -> Option<MessageEnvelope> {
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(&task_id) {
+            if task.status != TaskStatus::Pending {
+                tracing::warn!(
+                    "Attempted to poll task {} but status is {:?} (expected Pending)",
+                    task_id, task.status
+                );
+                return None;
+            }
             task.status = TaskStatus::Processing;
             task.updated_at = Utc::now();
             
@@ -218,7 +225,7 @@ impl Broker {
         }
 
         // Adjust rate limiter dynamic tracking based on incremental usage
-        self.limiter.report_actual_usage(&task.current_model, task.token_budget, tokens_used).await;
+        self.limiter.report_actual_usage(&task.current_model, task_id, tokens_used, pause_request).await;
 
         task.tokens_used = tokens_used;
         task.cost_usd = cost_usd;
@@ -256,7 +263,7 @@ impl Broker {
         let task = tasks.get_mut(&task_id).ok_or_else(|| BrokerError::TaskNotFound(task_id))?;
 
         // Adjust rate limiter dynamic tracking
-        self.limiter.report_actual_usage(&task.current_model, task.token_budget, tokens_used).await;
+        self.limiter.report_actual_usage(&task.current_model, task_id, tokens_used, true).await;
 
         task.status = TaskStatus::Completed;
         task.output = Some(output);
@@ -284,7 +291,7 @@ impl Broker {
             let task = tasks.get_mut(&task_id).ok_or_else(|| BrokerError::TaskNotFound(task_id))?;
 
             // Adjust rate limiter dynamic tracking
-            self.limiter.report_actual_usage(&task.current_model, task.token_budget, tokens_used).await;
+            self.limiter.report_actual_usage(&task.current_model, task_id, tokens_used, true).await;
 
             task.tokens_used = tokens_used;
             task.cost_usd = cost_usd;

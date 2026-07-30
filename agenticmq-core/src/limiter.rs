@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use tokio::sync::{RwLock, Mutex};
 use chrono::{DateTime, Utc, Duration};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ModelLimit {
@@ -11,7 +12,9 @@ pub struct ModelLimit {
 #[derive(Debug, Clone)]
 struct RateEvent {
     timestamp: DateTime<Utc>,
+    task_id: Uuid,
     tokens: u32,
+    resolved: bool,
 }
 
 #[derive(Debug)]
@@ -65,15 +68,10 @@ impl TokenRateLimiter {
         limits.insert(model, ModelLimit { tpm, rpm });
     }
 
-    pub async fn get_limit(&self, model: &str) -> Option<ModelLimit> {
-        let limits = self.limits.read().await;
-        limits.get(model).cloned()
-    }
-
     /// Checks if a task with the given token budget can be executed right now.
     /// If it can, it records the request and returns Ok(()).
     /// Otherwise, it returns Err(String) describing which limit was exceeded.
-    pub async fn check_and_record(&self, model: &str, token_budget: u32) -> Result<(), String> {
+    pub async fn check_and_record(&self, model: &str, task_id: Uuid, token_budget: u32) -> Result<(), String> {
         let limits = self.limits.read().await;
         let limit = match limits.get(model) {
             Some(l) => l,
@@ -81,13 +79,20 @@ impl TokenRateLimiter {
         };
 
         let now = Utc::now();
-        let cutoff = now - Duration::seconds(60);
+        let standard_cutoff = now - Duration::seconds(60);
+        let safety_cutoff = now - Duration::minutes(10);
 
         let mut history_map = self.history.lock().await;
         let events = history_map.entry(model.to_string()).or_default();
 
-        // Prune old events outside our sliding window (older than 60 seconds)
-        events.retain(|event| event.timestamp > cutoff);
+        // Prune old events:
+        // Keep if it is less than 60s old, OR if it's not resolved and less than 10 minutes old.
+        events.retain(|event| {
+            if event.timestamp > standard_cutoff {
+                return true;
+            }
+            !event.resolved && event.timestamp > safety_cutoff
+        });
 
         // Calculate current usage
         let current_requests = events.len() as u32;
@@ -112,24 +117,22 @@ impl TokenRateLimiter {
         // Within limits: Record the event
         events.push(RateEvent {
             timestamp: now,
+            task_id,
             tokens: token_budget,
+            resolved: false,
         });
 
         Ok(())
     }
 
     /// Reports actual token usage after task completion/checkpoint, adjusting the registered window.
-    pub async fn report_actual_usage(&self, model: &str, reserved_tokens: u32, actual_tokens: u32) {
-        if reserved_tokens == actual_tokens {
-            return;
-        }
-
+    pub async fn report_actual_usage(&self, model: &str, task_id: Uuid, actual_tokens: u32, resolved: bool) {
         let mut history_map = self.history.lock().await;
         if let Some(events) = history_map.get_mut(model) {
-            // Find the most recent event with the reserved tokens and adjust it,
-            // or simply adjust the total weight.
-            if let Some(event) = events.iter_mut().rev().find(|e| e.tokens == reserved_tokens) {
+            // Find the event by task_id and adjust its token budget & resolution status
+            if let Some(event) = events.iter_mut().find(|e| e.task_id == task_id) {
                 event.tokens = actual_tokens;
+                event.resolved = resolved;
             }
         }
     }
@@ -145,12 +148,16 @@ mod tests {
         // Set tight limits: 1000 tokens, 2 requests per minute
         limiter.set_limit("test-model".to_string(), 1000, 2).await;
 
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let t3 = Uuid::new_v4();
+
         // First request: Should pass
-        assert!(limiter.check_and_record("test-model", 100).await.is_ok());
+        assert!(limiter.check_and_record("test-model", t1, 100).await.is_ok());
         // Second request: Should pass
-        assert!(limiter.check_and_record("test-model", 100).await.is_ok());
+        assert!(limiter.check_and_record("test-model", t2, 100).await.is_ok());
         // Third request: Should fail (RPM exceeded)
-        let res = limiter.check_and_record("test-model", 100).await;
+        let res = limiter.check_and_record("test-model", t3, 100).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("RPM limit exceeded"));
     }
@@ -161,10 +168,13 @@ mod tests {
         // Set limits: 500 tokens, 10 requests per minute
         limiter.set_limit("test-model".to_string(), 500, 10).await;
 
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
         // First request: Should pass
-        assert!(limiter.check_and_record("test-model", 300).await.is_ok());
+        assert!(limiter.check_and_record("test-model", t1, 300).await.is_ok());
         // Second request: Should fail (TPM exceeded: 300 + 300 = 600 > 500)
-        let res = limiter.check_and_record("test-model", 300).await;
+        let res = limiter.check_and_record("test-model", t2, 300).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("TPM limit exceeded"));
     }
@@ -174,16 +184,74 @@ mod tests {
         let limiter = TokenRateLimiter::new();
         limiter.set_limit("test-model".to_string(), 500, 10).await;
 
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
         // Reserve 400 tokens (out of 500)
-        assert!(limiter.check_and_record("test-model", 400).await.is_ok());
+        assert!(limiter.check_and_record("test-model", t1, 400).await.is_ok());
 
         // Second request for 200 tokens fails because 400 + 200 > 500
-        assert!(limiter.check_and_record("test-model", 200).await.is_err());
+        assert!(limiter.check_and_record("test-model", t2, 200).await.is_err());
 
-        // Report that the first request only used 100 tokens
-        limiter.report_actual_usage("test-model", 400, 100).await;
+        // Report that the first request only used 100 tokens, mark as resolved
+        limiter.report_actual_usage("test-model", t1, 100, true).await;
 
         // Second request should now pass, since active tokens is 100 + 200 = 300 <= 500
-        assert!(limiter.check_and_record("test-model", 200).await.is_ok());
+        assert!(limiter.check_and_record("test-model", t2, 200).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy() {
+        let limiter = TokenRateLimiter::new();
+        limiter.set_limit("test-model".to_string(), 1000, 10).await;
+
+        let now = Utc::now();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let t3 = Uuid::new_v4();
+
+        {
+            let mut history = limiter.history.lock().await;
+            let events = history.entry("test-model".to_string()).or_default();
+            
+            // Event 1: unresolved, 2 minutes old -> should be kept (age < 10m)
+            events.push(RateEvent {
+                timestamp: now - Duration::seconds(120),
+                task_id: t1,
+                tokens: 100,
+                resolved: false,
+            });
+
+            // Event 2: resolved, 2 minutes old -> should be pruned (age > 60s)
+            events.push(RateEvent {
+                timestamp: now - Duration::seconds(120),
+                task_id: t2,
+                tokens: 100,
+                resolved: true,
+            });
+
+            // Event 3: unresolved, 11 minutes old -> should be pruned (age > 10m)
+            events.push(RateEvent {
+                timestamp: now - Duration::seconds(660),
+                task_id: t3,
+                tokens: 100,
+                resolved: false,
+            });
+        }
+
+        // Trigger prune by checking a new record
+        let t4 = Uuid::new_v4();
+        assert!(limiter.check_and_record("test-model", t4, 50).await.is_ok());
+
+        // Check history contents
+        let history = limiter.history.lock().await;
+        let events = history.get("test-model").unwrap();
+        
+        // Should only contain:
+        // 1. Event 1 (t1 - unresolved, 2 min old)
+        // 2. Event 4 (t4 - newly created)
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e.task_id == t1));
+        assert!(events.iter().any(|e| e.task_id == t4));
     }
 }

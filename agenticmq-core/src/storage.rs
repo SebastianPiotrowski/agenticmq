@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::Arc;
-use uuid::Uuid;
 use crate::envelope::MessageEnvelope;
 
 #[derive(Clone)]
@@ -27,20 +26,6 @@ impl SledStorage {
         .await?
     }
 
-    pub async fn load_task(&self, task_id: Uuid) -> Result<Option<MessageEnvelope>, anyhow::Error> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let key = task_id.as_bytes();
-            if let Some(ivec) = db.get(key)? {
-                let task: MessageEnvelope = serde_json::from_slice(&ivec)?;
-                Ok(Some(task))
-            } else {
-                Ok(None)
-            }
-        })
-        .await?
-    }
-
     pub async fn load_all_tasks(&self) -> Result<Vec<MessageEnvelope>, anyhow::Error> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -51,17 +36,6 @@ impl SledStorage {
                 tasks.push(task);
             }
             Ok(tasks)
-        })
-        .await?
-    }
-
-    pub async fn delete_task(&self, task_id: Uuid) -> Result<(), anyhow::Error> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let key = task_id.as_bytes();
-            db.remove(key)?;
-            db.flush()?;
-            Ok::<(), anyhow::Error>(())
         })
         .await?
     }

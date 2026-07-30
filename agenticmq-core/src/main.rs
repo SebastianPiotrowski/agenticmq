@@ -30,7 +30,6 @@ impl IntoResponse for AppError {
             BrokerError::TaskNotFound(_) => StatusCode::NOT_FOUND,
             BrokerError::InvalidStatus { .. } => StatusCode::BAD_REQUEST,
             BrokerError::InvalidResumeKey(_) => StatusCode::FORBIDDEN,
-            BrokerError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (

@@ -19,9 +19,6 @@ pub enum BrokerError {
     #[error("Invalid or missing resume key for task {0}")]
     InvalidResumeKey(Uuid),
 
-    #[error("Rate limit check failed: {0}")]
-    RateLimit(String),
-
     #[error("Internal error: {0}")]
     Internal(String),
 }
