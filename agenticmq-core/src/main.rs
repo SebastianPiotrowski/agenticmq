@@ -6,8 +6,8 @@ mod error;
 
 use std::sync::Arc;
 use axum::{
-    extract::{Path, Query, State, HeaderMap},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{StatusCode, HeaderMap},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,

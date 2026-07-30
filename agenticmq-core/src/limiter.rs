@@ -84,7 +84,7 @@ impl TokenRateLimiter {
         let cutoff = now - Duration::seconds(60);
 
         let mut history_map = self.history.lock().await;
-        let events = history_map.entry(model.to_string()).or_insert_with(Vec::new());
+        let events = history_map.entry(model.to_string()).or_default();
 
         // Prune old events outside our sliding window (older than 60 seconds)
         events.retain(|event| event.timestamp > cutoff);

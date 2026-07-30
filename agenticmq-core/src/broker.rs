@@ -279,10 +279,7 @@ impl Broker {
         tokens_used: u32,
         cost_usd: f64,
     ) -> Result<MessageEnvelope, BrokerError> {
-        let mut task_to_requeue = None;
-        let mut result_task = None;
-
-        {
+        let (task_to_requeue, result_task) = {
             let mut tasks = self.tasks.write().await;
             let task = tasks.get_mut(&task_id).ok_or_else(|| BrokerError::TaskNotFound(task_id))?;
 
@@ -294,7 +291,7 @@ impl Broker {
             task.error_message = Some(error.clone());
             task.updated_at = Utc::now();
 
-            if !task.fallback_models.is_empty() {
+            let task_to_requeue = if !task.fallback_models.is_empty() {
                 // Perform smart fallback routing
                 let next_model = task.fallback_models.remove(0);
                 let prev_model = std::mem::replace(&mut task.current_model, next_model.clone());
@@ -306,17 +303,18 @@ impl Broker {
                     task_id, prev_model, next_model, task.trace_depth
                 );
 
-                task_to_requeue = Some((task_id, next_model));
+                Some((task_id, next_model))
             } else {
                 task.status = TaskStatus::Failed;
                 tracing::error!("Task {} failed, no fallback models left. Error: {}", task_id, error);
-            }
+                None
+            };
 
             self.storage.save_task(task).await
                 .map_err(|e| BrokerError::Storage(e.to_string()))?;
             
-            result_task = Some(task.clone());
-        }
+            (task_to_requeue, task.clone())
+        };
 
         // Re-queue the task if it fell back to another model
         if let Some((tid, model)) = task_to_requeue {
@@ -326,13 +324,11 @@ impl Broker {
             }
         }
 
-        Ok(result_task.unwrap())
+        Ok(result_task)
     }
 
     pub async fn resume_task(&self, task_id: Uuid, resume_key: &str) -> Result<MessageEnvelope, BrokerError> {
-        let mut model_to_requeue = None;
-
-        {
+        let model_to_requeue = {
             let mut tasks = self.tasks.write().await;
             let task = tasks.get_mut(&task_id).ok_or_else(|| BrokerError::TaskNotFound(task_id))?;
 
@@ -349,16 +345,17 @@ impl Broker {
                     task.status = TaskStatus::Pending;
                     task.resume_key = None;
                     task.updated_at = Utc::now();
-                    model_to_requeue = Some((task_id, task.current_model.clone()));
+                    let model_to_requeue = Some((task_id, task.current_model.clone()));
                     
                     self.storage.save_task(task).await
                         .map_err(|e| BrokerError::Storage(e.to_string()))?;
                     
                     tracing::info!("Task {} successfully resumed", task_id);
+                    model_to_requeue
                 }
                 _ => return Err(BrokerError::InvalidResumeKey(task_id)),
             }
-        }
+        };
 
         if let Some((tid, model)) = model_to_requeue {
             let model_queue = self.get_or_create_queue(&model).await;
