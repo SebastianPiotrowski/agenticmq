@@ -23,6 +23,9 @@ pub struct TokenRateLimiter {
     history: Mutex<HashMap<String, Vec<RateEvent>>>,
 }
 
+const SLIDING_WINDOW_SECS: i64 = 60;
+const UNRESOLVED_SAFETY_WINDOW_MINS: i64 = 10;
+
 impl TokenRateLimiter {
     pub fn new() -> Self {
         let mut limits = HashMap::new();
@@ -68,25 +71,20 @@ impl TokenRateLimiter {
         limits.insert(model, ModelLimit { tpm, rpm });
     }
 
-    /// Checks if a task with the given token budget can be executed right now.
-    /// If it can, it records the request and returns Ok(()).
-    /// Otherwise, it returns Err(String) describing which limit was exceeded.
     pub async fn check_and_record(&self, model: &str, task_id: Uuid, token_budget: u32) -> Result<(), String> {
         let limits = self.limits.read().await;
         let limit = match limits.get(model) {
             Some(l) => l,
-            None => return Ok(()), // No limits configured for this model, proceed immediately
+            None => return Ok(()),
         };
 
         let now = Utc::now();
-        let standard_cutoff = now - Duration::seconds(60);
-        let safety_cutoff = now - Duration::minutes(10);
+        let standard_cutoff = now - Duration::seconds(SLIDING_WINDOW_SECS);
+        let safety_cutoff = now - Duration::minutes(UNRESOLVED_SAFETY_WINDOW_MINS);
 
         let mut history_map = self.history.lock().await;
         let events = history_map.entry(model.to_string()).or_default();
 
-        // Prune old events:
-        // Keep if it is less than 60s old, OR if it's not resolved and less than 10 minutes old.
         events.retain(|event| {
             if event.timestamp > standard_cutoff {
                 return true;
@@ -94,7 +92,6 @@ impl TokenRateLimiter {
             !event.resolved && event.timestamp > safety_cutoff
         });
 
-        // Calculate current usage
         let current_requests = events.len() as u32;
         let current_tokens: u32 = events.iter().map(|e| e.tokens).sum();
 

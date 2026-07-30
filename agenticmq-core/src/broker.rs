@@ -191,14 +191,14 @@ impl Broker {
 
         let mut deferred = queue.deferred.lock().await;
 
-        // Drain the rx channel completely into deferred
+        let mut added = false;
         let mut rx = queue.rx.lock().await;
         while let Ok(task_id) = rx.try_recv() {
             deferred.push(task_id);
+            added = true;
         }
 
-        // Sort deferred by priority (descending) and then created_at (ascending)
-        {
+        if added {
             let tasks = self.tasks.read().await;
             deferred.sort_by(|a, b| {
                 let task_a = tasks.get(a);
@@ -477,9 +477,9 @@ impl Broker {
             task.updated_at = Utc::now();
 
             let task_to_requeue = if task.retry_count < task.max_retries {
-                // Exponential backoff retry on the SAME model
                 task.retry_count += 1;
-                let backoff_secs = 2u64.pow(task.retry_count); // 2, 4, 8, 16...
+                let effective_exponent = std::cmp::min(task.retry_count, 10);
+                let backoff_secs = 2u64.pow(effective_exponent);
                 task.run_after = Some(Utc::now() + chrono::Duration::seconds(backoff_secs as i64));
                 task.status = TaskStatus::Pending;
                 
@@ -488,7 +488,6 @@ impl Broker {
                     task_id, task.retry_count, task.max_retries, backoff_secs, task.run_after
                 );
 
-                // Re-enqueue by spawning a tokio delay task
                 let broker = self.clone();
                 let model = task.current_model.clone();
                 tokio::spawn(async move {
@@ -1029,6 +1028,40 @@ mod tests {
         let polled_task = polled_retry.unwrap();
         assert_eq!(polled_task.task_id, task.task_id);
         assert_eq!(polled_task.retry_count, 1);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_retry_overflow_protection() {
+        let path = temp_broker_path("retry_overflow");
+        let broker = Arc::new(Broker::new(&path).await.unwrap());
+
+        let task = broker.submit_task(
+            "overflow test".to_string(),
+            None,
+            100,
+            0.1,
+            "gpt-4o".to_string(),
+            vec![],
+            0,
+            None,
+            100,
+        ).await.unwrap();
+
+        {
+            let mut tasks = broker.tasks.write().await;
+            let t = tasks.get_mut(&task.task_id).unwrap();
+            t.retry_count = 63;
+            broker.storage.save_task(t).await.unwrap();
+        }
+
+        let polled = broker.poll_task("gpt-4o").await.unwrap();
+
+        let failed = broker.fail_task(polled.task_id, "error".to_string(), 50, 0.001).await.unwrap();
+        
+        assert_eq!(failed.retry_count, 64);
+        assert_eq!(failed.status, TaskStatus::Pending);
 
         let _ = fs::remove_dir_all(path);
     }
