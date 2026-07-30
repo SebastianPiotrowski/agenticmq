@@ -10,7 +10,8 @@ class AgenticMQClient:
     
     def __init__(self, base_url: str = "http://127.0.0.1:8080"):
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self.base_url)
+        # Set a 60-second default timeout to handle server-side long polling safely
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(60.0))
 
     async def close(self):
         """Close the underlying HTTP client."""
@@ -30,6 +31,7 @@ class AgenticMQClient:
         max_cost_usd: float = 0.05,
         model: str = "gpt-4o",
         fallback_models: Optional[List[str]] = None,
+        max_retries: int = 3,
     ) -> Dict[str, Any]:
         """Submit a new task to the broker."""
         payload = {
@@ -39,6 +41,7 @@ class AgenticMQClient:
             "max_cost_usd": max_cost_usd,
             "model": model,
             "fallback_models": fallback_models or [],
+            "max_retries": max_retries,
         }
         
         response = await self._client.post("/tasks", json=payload)

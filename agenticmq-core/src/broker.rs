@@ -15,6 +15,7 @@ pub struct ModelQueue {
     tx: Sender<Uuid>,
     rx: TokioMutex<Receiver<Uuid>>,
     deferred: TokioMutex<Vec<Uuid>>,
+    pub notify: Arc<tokio::sync::Notify>,
 }
 
 impl ModelQueue {
@@ -24,6 +25,7 @@ impl ModelQueue {
             tx,
             rx: TokioMutex::new(rx),
             deferred: TokioMutex::new(Vec::new()),
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -98,6 +100,7 @@ impl Broker {
         fallback_models: Vec<String>,
         priority: i8,
         ttl_seconds: Option<u64>,
+        max_retries: u32,
     ) -> Result<MessageEnvelope, BrokerError> {
         let task = MessageEnvelope::new(
             prompt_data,
@@ -108,6 +111,7 @@ impl Broker {
             fallback_models,
             priority,
             ttl_seconds,
+            max_retries,
         );
 
         // Save to disk
@@ -127,6 +131,9 @@ impl Broker {
         if let Err(e) = model_queue.tx.send(task_id).await {
             return Err(BrokerError::Internal(format!("Failed to enqueue task: {}", e)));
         }
+
+        // Wake up any long-polling workers
+        model_queue.notify.notify_waiters();
 
         tracing::info!("Task {} submitted for model {}", task_id, task.current_model);
         Ok(task)
@@ -222,6 +229,14 @@ impl Broker {
 
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(&task_id) {
+                if let Some(run_after) = task.run_after {
+                    if Utc::now() < run_after {
+                        drop(tasks);
+                        idx += 1;
+                        continue;
+                    }
+                }
+
                 if task.status == TaskStatus::Pending {
                     if self.limiter.check_and_record(model, task_id, task.token_budget).await.is_ok() {
                         selected_index = Some(idx);
@@ -244,6 +259,40 @@ impl Broker {
         if let Some(idx) = selected_index {
             let task_id = deferred.remove(idx);
             return self.set_task_processing(task_id, model).await;
+        }
+
+        None
+    }
+
+    pub async fn poll_task_long(self: &Arc<Self>, model: &str, timeout: tokio::time::Duration) -> Option<MessageEnvelope> {
+        let queue = self.get_or_create_queue(model).await;
+
+        // Try polling immediately
+        if let Some(task) = self.poll_task(model).await {
+            return Some(task);
+        }
+
+        // Wait for notification or timeout
+        let notify = queue.notify.clone();
+        let broker = self.clone();
+        let model_str = model.to_string();
+
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+
+        loop {
+            let notified = notify.notified();
+
+            tokio::select! {
+                _ = &mut sleep => {
+                    break;
+                }
+                _ = notified => {
+                    if let Some(task) = broker.poll_task(&model_str).await {
+                        return Some(task);
+                    }
+                }
+            }
         }
 
         None
@@ -362,6 +411,10 @@ impl Broker {
         self.storage.save_task(task).await
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
 
+        // Notify queue of potentially freed token capacity
+        let model_queue = self.get_or_create_queue(&task.current_model).await;
+        model_queue.notify.notify_waiters();
+
         Ok(task.clone())
     }
 
@@ -396,12 +449,16 @@ impl Broker {
         self.storage.save_task(task).await
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
 
+        // Notify queue of freed token capacity
+        let model_queue = self.get_or_create_queue(&task.current_model).await;
+        model_queue.notify.notify_waiters();
+
         tracing::info!("Task {} successfully completed", task_id);
         Ok(task.clone())
     }
 
     pub async fn fail_task(
-        &self,
+        self: &Arc<Self>,
         task_id: Uuid,
         error: String,
         tokens_used: u32,
@@ -419,22 +476,49 @@ impl Broker {
             task.error_message = Some(error.clone());
             task.updated_at = Utc::now();
 
-            let task_to_requeue = if !task.fallback_models.is_empty() {
-                // Perform smart fallback routing
+            let task_to_requeue = if task.retry_count < task.max_retries {
+                // Exponential backoff retry on the SAME model
+                task.retry_count += 1;
+                let backoff_secs = 2u64.pow(task.retry_count); // 2, 4, 8, 16...
+                task.run_after = Some(Utc::now() + chrono::Duration::seconds(backoff_secs as i64));
+                task.status = TaskStatus::Pending;
+                
+                tracing::warn!(
+                    "Task {} failed. Scheduling retry {}/{} after {}s delay at {:?}",
+                    task_id, task.retry_count, task.max_retries, backoff_secs, task.run_after
+                );
+
+                // Re-enqueue by spawning a tokio delay task
+                let broker = self.clone();
+                let model = task.current_model.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                    let model_queue = broker.get_or_create_queue(&model).await;
+                    if let Err(e) = model_queue.tx.send(task_id).await {
+                        tracing::error!("Failed to re-enqueue retried task: {}", e);
+                    }
+                    model_queue.notify.notify_waiters();
+                });
+
+                None
+            } else if !task.fallback_models.is_empty() {
+                // Perform smart fallback routing (retries exhausted or max_retries = 0)
                 let next_model = task.fallback_models.remove(0);
                 let prev_model = std::mem::replace(&mut task.current_model, next_model.clone());
                 task.status = TaskStatus::Pending;
+                task.run_after = None; // clear backoff
                 task.trace_depth += 1;
                 
                 tracing::warn!(
-                    "Task {} failed on model '{}'. Routing to fallback model '{}' (trace depth: {})",
+                    "Task {} failed on model '{}' (retries exhausted). Routing to fallback model '{}' (trace depth: {})",
                     task_id, prev_model, next_model, task.trace_depth
                 );
 
                 Some((task_id, next_model))
             } else {
                 task.status = TaskStatus::Failed;
-                tracing::error!("Task {} failed, no fallback models left. Error: {}", task_id, error);
+                task.run_after = None;
+                tracing::error!("Task {} failed terminally, no retries or fallback models left. Error: {}", task_id, error);
                 None
             };
 
@@ -450,6 +534,7 @@ impl Broker {
             if let Err(e) = model_queue.tx.send(tid).await {
                 return Err(BrokerError::Internal(format!("Failed to re-enqueue task: {}", e)));
             }
+            model_queue.notify.notify_waiters();
         }
 
         Ok(result_task)
@@ -490,6 +575,7 @@ impl Broker {
             if let Err(e) = model_queue.tx.send(tid).await {
                 return Err(BrokerError::Internal(format!("Failed to re-enqueue resumed task: {}", e)));
             }
+            model_queue.notify.notify_waiters();
         }
 
         let tasks = self.tasks.read().await;
@@ -572,6 +658,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         assert_eq!(task.current_model, "gpt-4o");
@@ -602,11 +689,14 @@ mod tests {
             vec!["gpt-4o-mini".to_string()],
             0,
             None,
+            0, // 0 retries so it falls back immediately
         ).await.unwrap();
 
+        let broker_arc = Arc::new(broker);
+
         // Poll and fail
-        let polled = broker.poll_task("gpt-4o").await.unwrap();
-        let failed_task = broker.fail_task(polled.task_id, "Rate limit hit".to_string(), 50, 0.001).await.unwrap();
+        let polled = broker_arc.poll_task("gpt-4o").await.unwrap();
+        let failed_task = broker_arc.fail_task(polled.task_id, "Rate limit hit".to_string(), 50, 0.001).await.unwrap();
 
         // Check it has been routed to fallback
         assert_eq!(failed_task.current_model, "gpt-4o-mini");
@@ -614,7 +704,7 @@ mod tests {
         assert_eq!(failed_task.trace_depth, 1);
 
         // Should be pollable on gpt-4o-mini now
-        let polled_fallback = broker.poll_task("gpt-4o-mini").await.unwrap();
+        let polled_fallback = broker_arc.poll_task("gpt-4o-mini").await.unwrap();
         assert_eq!(polled_fallback.task_id, task.task_id);
         assert_eq!(polled_fallback.status, TaskStatus::Processing);
 
@@ -635,6 +725,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         let polled = broker.poll_task("gpt-4o").await.unwrap();
@@ -683,6 +774,7 @@ mod tests {
             vec![],
             -5,
             None,
+            3,
         ).await.unwrap();
 
         // 2. Submit Normal Priority Task
@@ -695,6 +787,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         // 3. Submit High Priority Task
@@ -707,6 +800,7 @@ mod tests {
             vec![],
             10,
             None,
+            3,
         ).await.unwrap();
 
         // Poll 1: should be task_high
@@ -739,6 +833,7 @@ mod tests {
             vec![],
             0,
             Some(1),
+            3,
         ).await.unwrap();
 
         // Sleep for 1.5 seconds to trigger expiration
@@ -771,6 +866,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         // Poll it to set status to Processing
@@ -809,6 +905,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         // Submit task 2: completed, fresh
@@ -821,6 +918,7 @@ mod tests {
             vec![],
             0,
             None,
+            3,
         ).await.unwrap();
 
         // Manually update task states in storage and memory
@@ -848,6 +946,89 @@ mod tests {
         
         // t2 should still exist
         assert!(broker.get_task(t2.task_id).await.is_some());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_long_polling() {
+        let path = temp_broker_path("long_polling");
+        let broker = Arc::new(Broker::new(&path).await.unwrap());
+
+        let broker_clone = broker.clone();
+        
+        // Spawn a task that submits a new task after 500ms
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            broker_clone.submit_task(
+                "delayed task".to_string(),
+                None,
+                100,
+                0.1,
+                "gpt-4o".to_string(),
+                vec![],
+                0,
+                None,
+                3,
+            ).await.unwrap();
+        });
+
+        // Long poll for up to 3 seconds: should block and succeed when the task is submitted
+        let start = std::time::Instant::now();
+        let polled = broker.poll_task_long("gpt-4o", tokio::time::Duration::from_secs(3)).await;
+        let elapsed = start.elapsed();
+
+        assert!(polled.is_some());
+        assert_eq!(polled.unwrap().prompt_data, "delayed task");
+        assert!(elapsed >= std::time::Duration::from_millis(450)); // blocked
+        assert!(elapsed < std::time::Duration::from_secs(2));      // but finished quickly
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_retry_backoff() {
+        let path = temp_broker_path("retry_backoff");
+        let broker = Arc::new(Broker::new(&path).await.unwrap());
+
+        // Submit task with max_retries = 2
+        let task = broker.submit_task(
+            "will retry".to_string(),
+            None,
+            100,
+            0.1,
+            "gpt-4o".to_string(),
+            vec![],
+            0,
+            None,
+            2,
+        ).await.unwrap();
+
+        // 1. Poll task
+        let polled = broker.poll_task("gpt-4o").await.unwrap();
+        assert_eq!(polled.task_id, task.task_id);
+
+        // 2. Fail task (triggering first retry with backoff = 2^1 = 2 seconds)
+        let failed = broker.fail_task(polled.task_id, "transient error".to_string(), 50, 0.001).await.unwrap();
+        
+        // Check state
+        assert_eq!(failed.status, TaskStatus::Pending);
+        assert_eq!(failed.retry_count, 1);
+        assert!(failed.run_after.is_some());
+
+        // 3. Try polling immediately: should return None because run_after hasn't elapsed
+        let polled_too_early = broker.poll_task("gpt-4o").await;
+        assert!(polled_too_early.is_none());
+
+        // 4. Wait for the backoff delay (sleep 2.5 seconds)
+        tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+
+        // 5. Poll now: should succeed!
+        let polled_retry = broker.poll_task("gpt-4o").await;
+        assert!(polled_retry.is_some());
+        let polled_task = polled_retry.unwrap();
+        assert_eq!(polled_task.task_id, task.task_id);
+        assert_eq!(polled_task.retry_count, 1);
 
         let _ = fs::remove_dir_all(path);
     }

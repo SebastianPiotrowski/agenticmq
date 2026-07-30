@@ -58,11 +58,13 @@ struct SubmitTaskPayload {
     fallback_models: Option<Vec<String>>,
     priority: Option<i8>,
     ttl_seconds: Option<u64>,
+    max_retries: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct PollParams {
     model: String,
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +156,7 @@ async fn submit_task(
             payload.fallback_models.unwrap_or_default(),
             payload.priority.unwrap_or(0),
             payload.ttl_seconds,
+            payload.max_retries.unwrap_or(3),
         )
         .await?;
 
@@ -164,7 +167,8 @@ async fn poll_task(
     State(broker): State<Arc<Broker>>,
     Query(params): Query<PollParams>,
 ) -> ResultResponse<Json<Option<MessageEnvelope>>> {
-    let task = broker.poll_task(&params.model).await;
+    let timeout_dur = std::time::Duration::from_secs(params.timeout_seconds.unwrap_or(30));
+    let task = broker.poll_task_long(&params.model, timeout_dur).await;
     Ok(Json(task))
 }
 

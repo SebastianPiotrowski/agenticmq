@@ -40,11 +40,19 @@ pub struct MessageEnvelope {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 
-    // New fields
+    // Business fields
     #[serde(default)]
     pub priority: i8,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+
+    // Retry fields
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub run_after: Option<DateTime<Utc>>,
 }
 
 impl MessageEnvelope {
@@ -57,6 +65,7 @@ impl MessageEnvelope {
         fallback_models: Vec<String>,
         priority: i8,
         ttl_seconds: Option<u64>,
+        max_retries: u32,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -78,6 +87,9 @@ impl MessageEnvelope {
             updated_at: now,
             priority,
             ttl_seconds,
+            max_retries,
+            retry_count: 0,
+            run_after: None,
         }
     }
 }

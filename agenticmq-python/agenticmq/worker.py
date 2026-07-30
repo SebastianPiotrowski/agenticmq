@@ -32,7 +32,8 @@ class AgentWorker:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.poll_interval = poll_interval
-        self._client = httpx.AsyncClient(base_url=self.base_url)
+        # Configured a 60-second default timeout to handle server-side long polling safely
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(60.0))
         self._handler: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
         self._running = False
 
@@ -70,7 +71,8 @@ class AgentWorker:
 
     async def _poll_task(self) -> Optional[Dict[str, Any]]:
         try:
-            response = await self._client.get("/tasks/poll", params={"model": self.model})
+            # We long poll the broker for up to 30 seconds per request
+            response = await self._client.get("/tasks/poll", params={"model": self.model, "timeout_seconds": 30})
             if response.status_code == 200:
                 # Axum returns JSON task or null
                 return response.json()
@@ -136,9 +138,14 @@ class AgentWorker:
             if res.status_code == 200:
                 updated_task = res.json()
                 status = updated_task.get("status")
-                # If status is back to 'pending', it means it fell back
+                # If status is back to 'pending', it means it fell back or scheduled a retry
                 if status == "pending" or status == "Pending":
-                    logger.info(f"Task {task_id} failed. Routed to fallback model '{updated_task.get('current_model')}'")
+                    # Check if it was rescheduled for retry or routed to fallback
+                    run_after = updated_task.get("run_after")
+                    if run_after:
+                        logger.info(f"Task {task_id} failed. Rescheduled for retry count {updated_task.get('retry_count')} with delay.")
+                    else:
+                        logger.info(f"Task {task_id} failed. Routed to fallback model '{updated_task.get('current_model')}'")
                 else:
                     logger.error(f"Task {task_id} marked as Terminally Failed.")
             else:
