@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python environment and cache
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# AgenticMQ local state, config and logs
+.agenticmq_state/
+*.log
+.env
+
+# OS system files
+.DS_Store
