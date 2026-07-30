@@ -56,6 +56,8 @@ struct SubmitTaskPayload {
     max_cost_usd: f64,
     model: String,
     fallback_models: Option<Vec<String>>,
+    priority: Option<i8>,
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
     let state_dir = std::env::var("AGENTICMQ_STATE_DIR").unwrap_or_else(|_| ".agenticmq_state".to_string());
     let broker = Arc::new(Broker::new(&state_dir).await?);
 
+    // Start background garbage collector (sweeping once per hour)
+    broker.start_garbage_collector(tokio::time::Duration::from_secs(3600));
+
     // Setup CORS middleware
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -147,6 +152,8 @@ async fn submit_task(
             payload.max_cost_usd,
             payload.model,
             payload.fallback_models.unwrap_or_default(),
+            payload.priority.unwrap_or(0),
+            payload.ttl_seconds,
         )
         .await?;
 

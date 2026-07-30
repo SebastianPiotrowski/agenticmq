@@ -39,6 +39,12 @@ pub struct MessageEnvelope {
     // Timestamps
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+
+    // New fields
+    #[serde(default)]
+    pub priority: i8,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
 }
 
 impl MessageEnvelope {
@@ -49,6 +55,8 @@ impl MessageEnvelope {
         max_cost_usd: f64,
         model: String,
         fallback_models: Vec<String>,
+        priority: i8,
+        ttl_seconds: Option<u64>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -68,6 +76,8 @@ impl MessageEnvelope {
             error_message: None,
             created_at: now,
             updated_at: now,
+            priority,
+            ttl_seconds,
         }
     }
 }

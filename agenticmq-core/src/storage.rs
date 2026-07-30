@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use uuid::Uuid;
 use crate::envelope::MessageEnvelope;
 
 #[derive(Clone)]
@@ -36,6 +37,17 @@ impl SledStorage {
                 tasks.push(task);
             }
             Ok(tasks)
+        })
+        .await?
+    }
+
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<(), anyhow::Error> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = task_id.as_bytes();
+            db.remove(key)?;
+            db.flush()?;
+            Ok::<(), anyhow::Error>(())
         })
         .await?
     }
